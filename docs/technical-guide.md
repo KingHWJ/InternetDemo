@@ -1,23 +1,20 @@
 # 技术指南
 
-## 环境与启动
+## 构建与运行环境
 
-- 语言标准：C11。
-- 编译器：支持 C11 的 `cc`、Clang 或 GCC。
-- 构建工具：GNU Make。
-- 外部依赖：无。
-- 权限：普通用户权限即可；程序不使用 raw socket，也不依赖网卡。
-
-在项目根目录运行 `make` 编译，生成 `build/packet_demo`；运行 `make run` 编译并启动示例；运行 `make clean` 删除 `build/`。
-
-也可以不用 Make，手动编译：
+- C11 编译器：macOS 的 Apple Clang 或 Linux 上的 GCC/Clang。
+- Make。
+- 仅使用 C/POSIX socket、`poll` 和标准库，无第三方依赖。
+- 普通用户权限即可；只绑定本机 UDP loopback，不使用 raw socket。
 
 ```sh
-cc -std=c11 -Wall -Wextra -Wpedantic -O2 -o packet_demo src/main.c
-./packet_demo
+make
+./build/packet_demo --help
 ```
 
-## 目录结构
+两个终端启动方式和命令参数见[操作手册](操作手册.md)。`make receiver`、`make sender` 可分别使用默认参数启动角色；`make run` 显示帮助；`make clean` 删除构建目录。
+
+## 文件结构
 
 ```text
 .
@@ -27,24 +24,19 @@ cc -std=c11 -Wall -Wextra -Wpedantic -O2 -o packet_demo src/main.c
 │   ├── code-design.md
 │   ├── technical-guide.md
 │   └── 操作手册.md
-└── src/
-    └── main.c
+└── src/main.c
 ```
 
-## 报文格式与范围
+## 通信边界
 
-当前示例构造一帧 Ethernet II，其中 EtherType `0x0800` 表示 IPv4。IPv4 的 Protocol 字段为 `6`，表示 TCP。TCP 载荷是一条简短的 HTTP/1.1 GET 请求。
+程序用 UDP socket 连接 `127.0.0.1`，将自构造的 Ethernet/IPv4/TCP 字节帧作为 UDP 数据报负载交给对端进程。这里的 Ethernet MAC、`10.0.0.1`/`10.0.0.2` 地址和 TCP 端口都是教学帧里的逻辑值。实际操作系统只处理外层 UDP/IP；不会发生内核 TCP 三次握手，也不会在真实网卡上出现这些合成 Ethernet 帧。
 
-示例地址为 `192.0.2.10` 和 `198.51.100.20`，来自文档示例用途地址段；示例 MAC 是本地管理地址。它们是教学数据，不代表本机实际网卡地址。程序计算 IPv4 头部校验和与 TCP 校验和，并在解析时验证。
+因此日志能准确展示程序构造的教学报文字段和本程序状态机收到的字节，但不能用来断言 Linux/macOS 内核 TCP 的具体实现行为。真实 TCP 抓包需要另开真实 TCP socket 并使用抓包工具观察。
 
-解析器会验证帧长度、IPv4 版本和长度、TCP 长度与偏移、协议号、分片标志，并拒绝当前示例不支持的分片和非 TCP 数据。它不是完整 TCP/IP 栈：不建立真实 TCP 连接、不重传、不处理拥塞控制、路由、ARP、IPv6、TCP 选项或 IP 分片重组。
+## 可调限制
 
-## 日志层次
-
-- `[TX]`：在内存中构造示例报文完成。
-- `[RX]`：模拟网卡收到了字节帧，开始解析。
-- `[L2 Ethernet]`：读取 MAC 地址和 EtherType。
-- `[L3 IPv4]`：读取地址、总长度、TTL、协议号、分片字段和校验和。
-- `[L4 TCP]`：读取端口、序号、确认号、窗口、标志和校验和。
-- `[APP]`：将 TCP 载荷作为 HTTP 文本展示。
-- `[DONE]`：完成用户态解析；未发生真实网络收发。
+- 默认 UDP 端口：`9000`；自定义范围 `1024`–`65535`。
+- 空闲关闭计时：`1`–`120` 秒。计时在接收端确认收到回复 ACK 后开始。
+- 单条消息长度：1–500 字节。
+- 一次运行处理一条请求和一条回复，然后空闲超时并关闭。
+- 只支持 IPv4、未分片帧、固定长度 IPv4/TCP 头和单连接正常路径。

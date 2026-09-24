@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 #define ETHERNET_HEADER_SIZE 14U
@@ -337,6 +338,190 @@ static bool receive_packet(int socket_fd, int timeout_ms,
     return inspect_packet("RX 解包", packet, (size_t)received, view);
 }
 
+static int64_t monotonic_milliseconds(void)
+{
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0;
+    return (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+}
+
+static bool initiate_close(int socket_fd, const struct sockaddr_in *peer,
+                           bool from_client, uint32_t *send_next,
+                           uint32_t *receive_next)
+{
+    PacketView packet;
+    struct sockaddr_in source = *peer;
+
+    puts("[TIMEOUT/QUIT] 发起方发送 FIN（第 1 次挥手）。");
+    if (!send_packet(socket_fd, peer, from_client, *send_next, *receive_next,
+                     TCP_FIN | TCP_ACK, NULL, 0U)) return false;
+    (*send_next)++;
+    if (!receive_packet(socket_fd, 5000, &source, &packet) ||
+        packet.flags != TCP_ACK || packet.acknowledgement != *send_next) {
+        puts("[ERROR] 等待对端确认 FIN 超时或序号不匹配。");
+        return false;
+    }
+    puts("[STATE] 收到第 2 次挥手 ACK；等待对端 FIN。");
+    if (!receive_packet(socket_fd, 5000, &source, &packet) ||
+        packet.flags != (TCP_FIN | TCP_ACK) ||
+        packet.sequence != *receive_next ||
+        packet.acknowledgement != *send_next) {
+        puts("[ERROR] 等待对端 FIN 超时或序号不匹配。");
+        return false;
+    }
+    (*receive_next)++;
+    puts("[STATE] 收到第 3 次挥手 FIN，回复最终 ACK。");
+    if (!send_packet(socket_fd, peer, from_client, *send_next,
+                     *receive_next, TCP_ACK, NULL, 0U)) return false;
+    puts("[STATE] CLOSED：四次挥手完成。");
+    return true;
+}
+
+static bool respond_to_close(int socket_fd, const struct sockaddr_in *peer,
+                             bool from_client, PacketView *received,
+                             uint32_t *send_next, uint32_t *receive_next)
+{
+    struct sockaddr_in source = *peer;
+    PacketView packet;
+
+    if (received->sequence != *receive_next ||
+        received->acknowledgement != *send_next) {
+        puts("[ERROR] FIN 的序号或确认号不匹配。");
+        return false;
+    }
+    (*receive_next)++;
+    puts("[STATE] 收到第 1 次挥手 FIN，回复 ACK（第 2 次挥手）。");
+    if (!send_packet(socket_fd, peer, from_client, *send_next,
+                     *receive_next, TCP_ACK, NULL, 0U)) return false;
+    puts("[STATE] 发送自己的 FIN（第 3 次挥手）。");
+    if (!send_packet(socket_fd, peer, from_client, *send_next,
+                     *receive_next, TCP_FIN | TCP_ACK, NULL, 0U)) return false;
+    (*send_next)++;
+    if (!receive_packet(socket_fd, 5000, &source, &packet) ||
+        packet.flags != TCP_ACK || packet.acknowledgement != *send_next) {
+        puts("[ERROR] 等待最终 ACK 超时或序号不匹配。");
+        return false;
+    }
+    puts("[STATE] CLOSED：收到第 4 次挥手 ACK，连接关闭。");
+    return true;
+}
+
+static bool run_chat(int socket_fd, const struct sockaddr_in *peer,
+                     bool from_client, unsigned int idle_seconds,
+                     uint32_t *send_next, uint32_t *receive_next)
+{
+    struct sockaddr_in source = *peer;
+    PacketView packet;
+    struct pollfd descriptors[2];
+    bool stdin_open = true;
+    const int64_t activity_window_ms =
+        ((int64_t)idle_seconds + (from_client ? 15 : 0)) * 1000;
+    int64_t idle_deadline = monotonic_milliseconds() + activity_window_ms;
+
+    puts("[CHAT] 现在可以在任一终端输入消息并回车；输入 :quit 可主动关闭。\n"
+         "       接收端空闲超时后也会发起关闭。");
+    fflush(stdout);
+    for (;;) {
+        int64_t now = monotonic_milliseconds();
+        int64_t remaining = idle_deadline - now;
+        int timeout_ms;
+        int result;
+
+        if (remaining <= 0) {
+            if (!from_client) {
+                puts("[TIMEOUT] 接收端空闲计时到期。");
+                return initiate_close(socket_fd, peer, from_client,
+                                      send_next, receive_next);
+            }
+            puts("[ERROR] 等待接收端空闲超时关闭。");
+            return false;
+        }
+        timeout_ms = remaining > 2147483647 ? 2147483647 : (int)remaining;
+        descriptors[0].fd = stdin_open ? STDIN_FILENO : -1;
+        descriptors[0].events = POLLIN;
+        descriptors[0].revents = 0;
+        descriptors[1].fd = socket_fd;
+        descriptors[1].events = POLLIN;
+        descriptors[1].revents = 0;
+        do {
+            result = poll(descriptors, 2U, timeout_ms);
+        } while (result < 0 && errno == EINTR);
+        if (result < 0) {
+            perror("poll");
+            return false;
+        }
+        if (result == 0) continue;
+
+        if ((descriptors[1].revents & POLLIN) != 0) {
+            if (!receive_packet(socket_fd, 0, &source, &packet)) {
+                puts("[ERROR] 收到无法解析的报文。");
+                return false;
+            }
+            idle_deadline = monotonic_milliseconds() + activity_window_ms;
+            if ((packet.flags & (TCP_PSH | TCP_ACK)) == (TCP_PSH | TCP_ACK)) {
+                if (packet.sequence != *receive_next || packet.payload_length == 0U) {
+                    puts("[ERROR] 数据段序号不连续或载荷为空。");
+                    return false;
+                }
+                *receive_next += (uint32_t)packet.payload_length;
+                printf("[CHAT] 收到 %zu 字节；累计确认号=%u。\n",
+                       packet.payload_length, *receive_next);
+                if (!send_packet(socket_fd, peer, from_client, *send_next,
+                                 *receive_next, TCP_ACK, NULL, 0U)) return false;
+                idle_deadline = monotonic_milliseconds() + activity_window_ms;
+            } else if (packet.flags == (TCP_FIN | TCP_ACK)) {
+                return respond_to_close(socket_fd, peer, from_client, &packet,
+                                        send_next, receive_next);
+            } else if (packet.flags == TCP_ACK) {
+                if (packet.acknowledgement > *send_next) {
+                    puts("[ERROR] 对端确认号超出已发送数据范围。");
+                    return false;
+                }
+                printf("[CHAT] 收到 ACK，确认号=%u。\n", packet.acknowledgement);
+            } else {
+                puts("[ERROR] 当前聊天阶段收到不支持的 TCP 标志组合。");
+                return false;
+            }
+        }
+
+        if (stdin_open && (descriptors[0].revents & POLLIN) != 0) {
+            char line[502];
+            size_t length;
+            if (fgets(line, sizeof(line), stdin) == NULL) {
+                stdin_open = false;
+                continue;
+            }
+            length = strlen(line);
+            if (length > 0U && line[length - 1U] == '\n') {
+                line[--length] = '\0';
+            } else if (!feof(stdin)) {
+                int character;
+                while ((character = getchar()) != '\n' && character != EOF) {}
+                fputs("[CHAT] 消息超过 500 字节，已丢弃。\n", stdout);
+                continue;
+            }
+            if (length > 0U && line[length - 1U] == '\r') line[--length] = '\0';
+            if (strcmp(line, ":quit") == 0) {
+                return initiate_close(socket_fd, peer, from_client,
+                                      send_next, receive_next);
+            }
+            if (length == 0U) continue;
+            if (length > 500U) {
+                fputs("[CHAT] 消息超过 500 字节，已丢弃。\n", stdout);
+                continue;
+            }
+            if (!send_packet(socket_fd, peer, from_client, *send_next,
+                             *receive_next, TCP_PSH | TCP_ACK,
+                             (const uint8_t *)line, length)) return false;
+            *send_next += (uint32_t)length;
+            idle_deadline = monotonic_milliseconds() + activity_window_ms;
+        } else if (stdin_open &&
+                   (descriptors[0].revents & (POLLHUP | POLLERR)) != 0) {
+            stdin_open = false;
+        }
+    }
+}
+
 static bool parse_uint(const char *text, unsigned long minimum,
                        unsigned long maximum, unsigned long *value)
 {
@@ -432,32 +617,8 @@ static bool run_receiver(uint16_t port, unsigned int idle_seconds)
         puts("[ERROR] 回复数据的 ACK 超时或序号不匹配。");
         goto failed;
     }
-    puts("[STATE] 双向数据交换完成；开始空闲超时计时。");
-
-    if (receive_packet(socket_fd, (int)(idle_seconds * 1000U), &peer, &packet)) {
-        puts("[STATE] 空闲期收到额外报文；本示例只处理一次请求/回复。");
-        goto failed;
-    }
-    puts("[TIMEOUT] 空闲计时到期：接收端主动关闭，发送 FIN。");
-    if (!send_packet(socket_fd, &peer, false, server_next, client_next,
-                     TCP_FIN | TCP_ACK, NULL, 0U)) goto failed;
-    server_next++;
-
-    if (!receive_packet(socket_fd, 5000, &peer, &packet) ||
-        packet.flags != TCP_ACK || packet.acknowledgement != server_next) {
-        puts("[ERROR] 等待对端对 FIN 的 ACK 超时或序号不匹配。");
-        goto failed;
-    }
-    puts("[STATE] 收到第 2 次挥手 ACK；等待对端 FIN。");
-    if (!receive_packet(socket_fd, 5000, &peer, &packet) ||
-        packet.flags != (TCP_FIN | TCP_ACK) || packet.sequence != client_next) {
-        puts("[ERROR] 等待对端 FIN 超时或序号不匹配。");
-        goto failed;
-    }
-    puts("[STATE] 收到第 3 次挥手 FIN，回复最终 ACK。");
-    if (!send_packet(socket_fd, &peer, false, server_next,
-                     packet.sequence + 1U, TCP_ACK, NULL, 0U)) goto failed;
-    puts("[STATE] CLOSED：四次挥手完成。");
+    if (!run_chat(socket_fd, &peer, false, idle_seconds,
+                  &server_next, &client_next)) goto failed;
     close(socket_fd);
     return true;
 
@@ -533,30 +694,8 @@ static bool run_sender(const char *host, uint16_t port,
     server_next += (uint32_t)packet.payload_length;
     if (!send_packet(socket_fd, &peer, true, client_next, server_next,
                      TCP_ACK, NULL, 0U)) goto failed;
-    puts("[STATE] 已确认接收端回复；等待接收端空闲超时并发起 FIN。");
-
-    if (!receive_packet(socket_fd, (int)((idle_seconds + 15U) * 1000U),
-                        &peer, &packet) ||
-        packet.flags != (TCP_FIN | TCP_ACK) ||
-        packet.acknowledgement != client_next) {
-        puts("[ERROR] 等待接收端 FIN 超时或序号不匹配。");
-        goto failed;
-    }
-    server_next = packet.sequence + 1U;
-    puts("[STATE] 收到第 1 次挥手 FIN，立即回复 ACK（第 2 次挥手）。");
-    if (!send_packet(socket_fd, &peer, true, client_next, server_next,
-                     TCP_ACK, NULL, 0U)) goto failed;
-    puts("[STATE] 发送自己的 FIN（第 3 次挥手）。");
-    if (!send_packet(socket_fd, &peer, true, client_next, server_next,
-                     TCP_FIN | TCP_ACK, NULL, 0U)) goto failed;
-    client_next++;
-
-    if (!receive_packet(socket_fd, 5000, &peer, &packet) ||
-        packet.flags != TCP_ACK || packet.acknowledgement != client_next) {
-        puts("[ERROR] 最终 ACK 超时或序号不匹配。");
-        goto failed;
-    }
-    puts("[STATE] CLOSED：收到第 4 次挥手 ACK，连接关闭。");
+    if (!run_chat(socket_fd, &peer, true, idle_seconds,
+                  &client_next, &server_next)) goto failed;
     close(socket_fd);
     return true;
 
@@ -568,15 +707,15 @@ failed:
 static void print_usage(const char *program)
 {
     printf("用法：\n"
-           "  %s receive [端口=9000] [空闲秒数=5]\n"
-           "  %s send [接收端IPv4=127.0.0.1] [端口=9000] [空闲秒数=5] [消息]\n",
+           "  %s receive [端口=9000] [空闲秒数=30]\n"
+           "  %s send [接收端IPv4=127.0.0.1] [端口=9000] [空闲秒数=30] [消息]\n",
            program, program);
 }
 
 int main(int argc, char **argv)
 {
     unsigned long port = 9000UL;
-    unsigned long idle_seconds = 5UL;
+    unsigned long idle_seconds = 30UL;
     bool success;
 
     if (argc < 2 || strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0) {

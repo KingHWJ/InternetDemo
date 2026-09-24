@@ -9,15 +9,15 @@
 先在项目目录运行 `make`。终端 A 启动接收端：
 
 ```sh
-./build/packet_demo receive 9000 5
+./build/packet_demo receive 9000 30
 ```
 
 终端 B 启动发送端：
 
 ```sh
-./build/packet_demo send 127.0.0.1 9000 5 "你好，接收方"
+./build/packet_demo send 127.0.0.1 9000 30 "你好，接收方"
 ```
 
-最后一个数字是接收端在回复并收到确认后等待的空闲秒数。超时后接收端发起 FIN，双方打印四次挥手。更完整的步骤见[操作手册](docs/操作手册.md)。
+握手和首次自动回复完成后，两个终端都可以持续输入消息并回车；输入 `:quit` 可主动关闭。最后一个数字是空闲超时秒数，超时后接收端发起 FIN。更完整的步骤见[操作手册](docs/操作手册.md)。
 
 `make run` 显示命令帮助；`make clean` 清理编译产物。

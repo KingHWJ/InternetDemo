@@ -53,3 +53,31 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+# Project-specific build outputs
+/build/
+/packet_demo
+
+# IDE settings
+.idea/
+.vscode/
+
+# Crash dumps
+core
+core.*
+
+# CMake / Ninja generated build files
+/CMakeFiles/
+/CMakeCache.txt
+/cmake_install.cmake
+/compile_commands.json
+/build.ninja
+/.ninja_deps
+/.ninja_log
+
+# Operating system and editor temporary files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
